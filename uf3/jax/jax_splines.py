@@ -1,242 +1,320 @@
-from argparse import ArgumentError
-from math import degrees
 from typing import List, Tuple, Union
 import jax.numpy as jnp
-import numpy as onp
-from jax.lax import dynamic_slice, scan, map, dynamic_update_slice
-from jax import vmap, jit
+from jax.lax import dynamic_slice, scan, dynamic_update_slice
+from jax import jit, jvp
 
 from functools import partial
+import numpy as onp
+
+import warnings
+
+from enum import Enum
 
 Array = jnp.ndarray
 
+from uf3.util import jax_utils
 
-def _check_inputs(
-    knots: Union[Array, List[Array]],
-    degrees: Union[int, Tuple[int]],
-    coefficients: Array = None,
-):
-    if not isinstance(knots, List):
-        knots = [knots]
 
-    if isinstance(degrees, int):
-        if len(degrees) == 1:
-            degrees = (degrees,) * len(knots)
-        elif len(knots) != len(degrees):
-            raise ArgumentError(
-                "There has to be one degree per knot sequence or only one degree that will be applied to all dimensions."
-            )
-
-    for d, k in zip(degrees, knots):
-        if len(k) < 2 * d:
-            raise ArgumentError(
-                "There have to be atleast 2 * degree knots in each dimension."
-            )
-
-    if coefficients is not None:
-        shape = coefficients.shape
-        if len(shape) != len(degrees):
-            raise ArgumentError(
-                "The coefficient array has to have the same dimensions as the spline."
-            )
-        correct_shape = []
-        for d, k in zip(degrees, knots):
-            correct_shape.append(len(k) + d + 1)
-        correct_shape = tuple(correct_shape)
-        if correct_shape != shape:
-            raise ArgumentError(
-                "There have to be num_of_knots + degree + 1 coefficients in each dimension. The shape has to be"
-                + correct_shape
-            )
-
-    return (coefficients, knots, degrees)
+class BSplineBackend(Enum):
+    Symbolic = 0
+    DeBoor = 1
 
 
 def ndSpline(
     coefficients: Array,
     knots: Union[Array, List[Array]],
     degrees: Union[int, Tuple[int]],
+    backend=BSplineBackend.Symbolic,
 ):
-    return _ndSpline_unsafe(*_check_inputs(knots, degrees, coefficients))
+    """
+    Generates a spline function to evaluate the spline on given x.
+    For more flexibility see: _ndSpline_unsafe
+
+    The generated N-dimensional spline function takes an array with shape (d,) for d dimensions.
+    Use with vmap and inputs being of shape (N,d) N points to evaluate.
+    Use grad(spline) to compute gradients and vmap(grad(spline)) for multiple inputs.
+
+    Args:
+        coefficients: A jax.ndarray of shape (len(knots[i]) - degrees[i] - 1, ...)
+        knots: A list of knots with knots for each dimension or
+            a single array if the spline is one dimensional
+        degrees: A tuple with the spline degrees for each dimension.
+            Degree 3 for cubic splines is most optimized for.
+            Or a single integer is the spline is one dimensional.
+        backend: Choose how the B-splines are evaluated.
+            BSplineBackend.Symbolic is faster, but only available for degree 3.
+            BSplineBackend.DeBoor is more flexible.
+            TODO benchmark backend properly
+    """
+    coefficients, _knots, degrees = jax_utils.check_inputs(
+        knots, degrees, coefficients, padding=True
+    )
+    dimensions = len(degrees)
+    spline = ndSpline_unsafe(
+        coefficients, _knots, degrees, backend=backend, featurization=False
+    )
+
+    def fn(x):
+        # check number of arguments
+        if len(x) != dimensions:
+            raise ValueError(
+                f"This spline has dimension {dimensions}, but x has dimension {len(x)}."
+            )
+
+        # return 0 for x outside range
+        # mask = True
+        # n_x = len(x[0])
+        # for i in range(dimensions):
+        #     mask = mask and (knots[i][0] <= x[i]) and (knots[i][-1] > x[i])
+        return spline(x)  # * mask
 
 
-def _ndSpline_unsafe(coefficients: Array, knots: List[Array], degrees: Tuple[int]):
+def featurization_with_gradients(spline, coefficients=None):
+    """
+    Helper function for efficiently evaluating a featurizing spline
+    with the per coefficient gradients.
 
-    if len(degrees) == 1:
-        return spline_1d(coefficients, knots, degrees)
-    if len(degrees) == 3:
-        return spline_3d(coefficients, knots, degrees)
+    Args:
+        spline: A spline function obtained from ndSpline_unsafe with the
+            option featurization=True
+        coefficients: The spline coefficients as in ndSpline_unsafe
 
-    raise NotImplementedError("Arbitrary ND Splines are not supported at the moment.")
+    Returns:
+        A function like the one ndSpline_unsafe returns, but this function
+        will return a tuple of the featurized spline values and the featurized
+        gradients of the spline values.
+    """
+
+    def fn(*x, coefficients=coefficients):
+        y, dy = jvp(spline, x, (1.0,) * len(x))
+        return y, dy
+
+    return fn
+
+
+def ndSpline_unsafe(
+    knots: List[Array],
+    degrees: Tuple[int],
+    coefficients: Array = None,
+    backend=BSplineBackend.Symbolic,
+    featurization=False,
+    compress=True,
+):
+    """
+    Generates a spline function to evaluate the spline on given x.
+    The generated function can take a coefficients keyword argument,
+    all other parameters are fixed.
+
+    The generated N-dimensional spline function takes an array with shape (d,) for d dimensions.
+    Use with vmap and inputs being of shape (N,d) N points to evaluate.
+    Use grad(spline) to compute gradients and vmap(grad(spline)) for multiple inputs.
+
+    If featurization is True grad can not be used.
+
+    Args:
+        knots: A list of knots with knots for each dimension
+        degrees: A tuple with the spline degrees for each dimension.
+            Degree 3 for cubic splines is most optimized for.
+        coefficients: A jax.ndarray of shape (len(knots[i]) - degrees[i] - 1, ...)
+            Coefficients can also be supplied later to the returned spline function.
+        backend: Choose how the B-splines are evaluated.
+            BSplineBackend.Symbolic is faster, but only available for degree 3.
+            BSplineBackend.DeBoor is more flexible.
+        featurisation: Choose whether the returned function shoud evaluate the spline
+            or return an array of coefficients.shape with the contribution of each B-spline.
+            Note that if set to True, vmap has to be used.
+        compress: Reduces memory consumption. Experimental feature for benchmarking only.
+            Do not set manually.
+    """
+    if not jnp.all(jnp.asarray(degrees) == 3) and backend == BSplineBackend.Symbolic:
+        backend = BSplineBackend.DeBoor
+        warnings.warn(
+            "The symbolic backend is only available for k=3. Changed to DeBoor."
+        )
+    if compress and featurization:
+        compress = False
+        warnings.warn("Compression is not supported with featurization.")
 
     min = []
     max = []
-    padding = []
     s = []
     for t, k in zip(knots, degrees):
-        min.append(t[0])
-        max.append(t[-1])
-        t = jnp.pad(t, (k, k), "edge")
-        padding.append((k, k))
+        min.append(t[k])
+        max.append(t[-k - 1])
         s.append(
-            jit(vmap(partial(deBoor_basis_unsafe, k, t)))
-        )  # TODO benchmark with and without this jit
+            partial(bspline_factors, t, k=k, basis=backend, compress=compress)
+        )
 
     min = jnp.asarray(min)
     max = jnp.asarray(max)
+    x_dim = len(knots)
 
-    padding = tuple(padding)
-    c = jnp.pad(coefficients, padding)
+    indices = list(range(1, x_dim + 1))
+    selector = [[i] for i in indices]
 
-    x_dim = len(degrees)
+    if featurization:
+        out = list(range(1, x_dim + 1))
+    else:
+        out = []
 
-    def spline_fn(x: Array):
+    if not compress:
+        def spline_fn(*x, coefficients=coefficients):
+            data = []
+            in_cutoff = True
 
-        mask = jnp.logical_or(jnp.any(x < min, 1), jnp.any(x >= max, 1))
+            for i in range(x_dim):
+                cut_mask = (x[i] >= min[i]) & (x[i] < max[i])
+                data.append(s[i](x[i]) * cut_mask)
+                in_cutoff = cut_mask & in_cutoff
 
-        x = jnp.where(mask[:, jnp.newaxis], x, min)
+            # jnp.einsum(coefficients, *results of basis splines and axis, coefficient axis for featurization)
+            # jnp.einsum(coefficients, [0,1,2], A, [0], B, [1], C, [2])
+            arg = [item for sublist in zip(data, selector) for item in sublist]
+            return jnp.where(
+                in_cutoff, jnp.einsum(coefficients, indices, *arg, out), 0.0
+            )
 
-        # jnp.einsum(coefficients, *results of basis splines and axis, coefficient axis for featurization)
-        # jnp.einsum(coefficients, [0,1,2], A, [0], B, [1], C, [2])
+    else:
+        slice_size = tuple(onp.asarray(degrees) + 1)
 
-        # Test (from ndsplines line 221):
-        #  coefficient_selector = tuple(self.coefficient_selector[:num_points, ...].swapaxes(0,-1)) + (slice(None),)
-        result = jnp.einsum()  # TODO
+        def spline_fn(*x, coefficients=coefficients):
+            data = []
+            idx = []
+            in_cutoff = True
 
-        return jnp.where(mask, result, 0)
+            for i in range(x_dim):
+                cut_mask = (x[i] >= min[i]) & (x[i] < max[i])
+                y, iy = s[i](x[i])
+                data.append(y * cut_mask)
+                idx.append(iy)
+                in_cutoff = cut_mask & in_cutoff
 
-    return jit(spline_fn)
+            # jnp.einsum(coefficients, *results of basis splines and axis, coefficient axis for featurization)
+            # jnp.einsum(coefficients, [0,1,2], A, [0], B, [1], C, [2])
+            arg = [item for sublist in zip(data, selector) for item in sublist]
+            return jnp.where(
+                in_cutoff,
+                jnp.einsum(
+                    dynamic_slice(coefficients, tuple(idx), slice_size),
+                    indices,
+                    *arg,
+                    out,
+                ),
+                0.0,
+            )
+
+    return spline_fn
 
 
-def spline_1d(coefficients: Array, knots: List[Array], degrees: Tuple[int]):
+@partial(jit, static_argnames=["k", "basis", "safe", "compress"])
+def bspline_factors(
+    knots: Array,
+    x,
+    k=3,
+    basis=BSplineBackend.Symbolic,
+    safe=False,
+    # naive_search=False,
+    compress=False,
+):
     """
-    Optimized implementation specifically for 2-body potentials
+    safe = False -> Will silently return wrong values if knots[k] > x or knots[-k-1] <= x
+
+    It is generally faster to ensure the safety property in advance as safe=True results
+    in inefficient padding. You should apply padding in advance if necessary.
+    See: uf3.utils.jax_utils.add_padding
     """
-    pass
+    # if naive_search:
+    #     i = jnp.argmax(knots > x, 0)
+    # else:
+    i = jnp.searchsorted(knots, x, side="right")
 
-
-def spline_3d(coefficients: Array, knots: List[Array], degrees: Tuple[int]):
-    """
-    Optimized implementation specifically for 3-body potentials
-    """
-    pass
-
-
-def deBoor_basis(k: int, knots: Array, x):
-    """
-    knots of shape (2*k+1,) with 2*k+1 knots for the basis spline of degree k
-    (degree k represents k-th order polynomials, you will see k+1 used as the spline degree in some literature)
-    The values of the knots after knots[k+1] do not matter as long as they are larger.
-    They are simply needed since JAX requires static array sizes.
-
-    x has to be smaller than the last knot, but larger or equal to the first knot
-    Condition: knots[0] <= x < knots[-1]
-    """
-    # this time all knots - returns the solution to all 4 non zero basis functions
-
-    i = jnp.argmax(knots > x)
-    t = dynamic_slice(jnp.pad(knots, (k, k), "edge"), (i,), (2 * k,))
-
-    f = lambda c, a: (None, dynamic_slice(t, (a,), (k,)))
-
-    _, Order = scan(f, None, jnp.arange(1, k + 1))
-
-    # Division by 0 should result in 0
-    # TODO find relevant section in the deBoor book
-    A = jnp.nan_to_num((x - t[:k]) / (Order - t[:k]), False, 0.0, 0.0, 0.0)
-
-    B = jnp.nan_to_num((Order - x) / (Order - t[:k]), False, 0.0, 0.0, 0.0)
-
-    def do(c, a):
-        c = c.at[k + 1].set(0.0)
-        # A = a[0]
-        c = c.at[k + 2 : 2 * k + 2].set(c[1 : k + 1] * a[0])
-
-        # B = a[1]
-        c = c.at[k + 1 : 2 * k + 1].add(c[1 : k + 1] * a[1])
-
-        c = c.at[: k + 1].set(c[k + 1 : 2 * k + 2])
-
-        return (c, None)
-
-    init = jnp.zeros(2 * (k + 1), dtype=knots.dtype)
-    init = init.at[k].set(1.0)
-
-    out, _ = scan(do, init, jnp.stack([A, B], axis=1))
-
-    return (i - k - 1, out[: k + 1])
-
-
-def deBoor_getBasis(k: int):
-    return partial(deBoor_basis, k)
-
-
-def deBoor_basis_unsafe(k: int, knots: Array, x):
-    """
-    Will silently return wrong values if knots[k] > x or knots[-k] < x
-    """
-
-    i = jnp.argmax(knots > x)
-    t = dynamic_slice(knots, (i - k,), (2 * k,))
-
-    f = lambda c, a: (None, dynamic_slice(t, (a,), (k,)))
-
-    _, Order = scan(f, None, jnp.arange(1, k + 1))
-
-    # Division by 0 should result in 0
-    # TODO find relevant section in the deBoor book
-    base = Order - t[:k]
-    pred = base == 0
-    base = jnp.where(pred, 1.0, base)
-
-    # This version should be more memory efficient? But results in nan gradients for duplicate knots...
-    # A = jnp.nan_to_num((x - t[:k]) / (Order - t[:k]), False, 0.0, 0.0, 0.0)
-    # B = jnp.nan_to_num((Order - x) / (Order - t[:k]), False, 0.0, 0.0, 0.0)
-
-    A = jnp.where(pred, 0.0, (x - t[:k]) / base)
-
-    B = jnp.where(pred, 0.0, (Order - x) / base)
-
-    def do(c, a):
-        c = c.at[k + 1].set(0.0)
-        # A = a[0]
-        c = c.at[k + 2 : 2 * k + 2].set(c[1 : k + 1] * a[0])
-
-        # B = a[1]
-        c = c.at[k + 1 : 2 * k + 1].add(c[1 : k + 1] * a[1])
-
-        c = c.at[: k + 1].set(c[k + 1 : 2 * k + 2])
-
-        return (c, None)
-
-    init = jnp.zeros(2 * (k + 1), dtype=knots.dtype)
-    init = init.at[k].set(1.0)
-
-    out, _ = scan(do, init, jnp.stack([A, B], axis=1))
-
-    return (i - k - 1, out[: k + 1])
-
-
-def deBoor_factor_unsafe(k: int, knots: Array, x):
-    i, r = deBoor_basis_unsafe(k, knots, x)
+    if safe:
+        t = dynamic_slice(jnp.pad(knots, (k, k), "edge"), (i,), (2 * k,))
+    else:
+        t = dynamic_slice(knots, (i - k,), (2 * k,))
     max = len(knots) - k - 1
-    res = jnp.zeros(max)
-    res = dynamic_update_slice(res, r, (i,))
-    return res
+
+    if basis is BSplineBackend.Symbolic:
+        if k == 3:
+            r = symbolic_basis(t, x)
+        else:
+            raise NotImplementedError("Symbolic backend only for k=3")
+    if basis is BSplineBackend.DeBoor:
+        r = deBoor_basis(k, t, x)
+
+    if compress:
+        return r, jnp.int64((i - k - 1))
+    else:
+        res = jnp.zeros(max)
+        return dynamic_update_slice(res, r, (i - k - 1,))
 
 
-def deBoor_basis_reference(knots: onp.ndarray, deg: int, x):
-    # c = 1.0 * ((knots <= x)[:-1] & (knots > x)[1:])[: deg + 1]
+def deBoor_basis(k: int, t: Array, x):
+    """
+    Requires len(t) = 2*k
+    And t[k-1] <= x < t[k]
 
-    def f(x, i, k):
-        if k == 0:
-            if knots[i] <= x and x < knots[i + 1]:
-                return 1
-            else:
-                return 0
-        a = (x - knots[i]) / (knots[k + i] - knots[i])
-        b = (knots[i + k + 1] - x) / (knots[i + k + 1] - knots[i + 1])
-        return a * f(x, i, k - 1) + b * f(x, i + 1, k - 1)
+    This implementation is similar to SciPys _deBoor_D in __fitpack.h
+    Which itself is an adaptation of deBoors algorithm.
+    """
 
-    return f(x, 0, deg)
+    def do(c, a):
+        order = dynamic_slice(t, (a,), (k,))
+        base = order - t[:k]
+        pred = base != 0
+        base = jnp.where(pred, base, 1.0)
+        A = ((x - t[:k]) / base) * pred
+        B = ((order - x) / base) * pred
 
+        c = c.at[k + 2 : 2 * k + 2].set(c[1 : k + 1] * A)
+
+        c = c.at[k + 1 : 2 * k + 1].add(c[1 : k + 1] * B)
+
+        c = c.at[: k + 1].set(c[k + 1 : 2 * k + 2])
+
+        return (c, None)
+
+    init = jnp.zeros(2 * (k + 1), dtype=x.dtype)
+    init = init.at[k].set(1.0)
+
+    out, _ = scan(do, init, jnp.arange(1, k + 1))
+
+    return out[: k + 1]
+
+
+def symbolic_basis(t: Array, x):
+    """
+    Requires len(t) = 2*k
+    And t[k-1] <= x < t[k]
+
+    Basis evaluation for cubic B-splines based on the symbolic evaluation of the recursive definition.
+    """
+    k = 3
+
+    t32 = t[3] - t[2]
+    B11 = (t[3] - x) / t32
+    B21 = (x - t[2]) / t32
+
+    t31 = t[3] - t[1]
+    t42 = t[4] - t[2]
+    B02 = ((t[3] - x) / t31) * B11
+    B12a = ((x - t[1]) / t31) * B11
+    B12b = ((t[4] - x) / t42) * B21
+    B22 = ((x - t[2]) / t42) * B21
+    B12 = B12a + B12b
+
+    t30 = t[3] - t[0]
+    t41 = t[4] - t[1]
+    t52 = t[5] - t[2]
+    Bn13 = ((t[3] - x) / t30) * B02
+    B03a = ((x - t[0]) / t30) * B02
+    B03b = ((t[4] - x) / t41) * B12
+    B13a = ((x - t[1]) / t41) * B12
+    B13b = ((t[5] - x) / t52) * B22
+    B23 = ((x - t[2]) / t52) * B22
+    B03 = B03a + B03b
+    B13 = B13a + B13b
+
+    out = jnp.stack([Bn13, B03, B13, B23])
+
+    return out
