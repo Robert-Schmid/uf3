@@ -1,12 +1,4 @@
-import numpy as onp
-
 import jax.numpy as jnp
-from jax import vmap, grad, jit
-from jax import lax
-
-import optax
-
-from functools import partial
 
 from uf3.regression.regularize import get_regularizer_matrix, get_penalty_matrix_3D
 
